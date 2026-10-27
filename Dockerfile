@@ -20,6 +20,8 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 FROM debian:bookworm-slim
 
 # base tools expected from a slim VPS-style image
+# proot powers the /data translation layer (persistent guest rootfs without
+# privileged mounts — works on docker cloud hosts that only expose /data).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash \
@@ -35,6 +37,7 @@ RUN apt-get update \
       tmux \
       htop \
       tini \
+      proot \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/webshell /usr/local/bin/webshell

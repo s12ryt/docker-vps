@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -18,10 +19,36 @@ type config struct {
 	Password    string        // login password; empty means open (no password) mode
 	ShellPath   string        // shell executable spawned inside the PTY
 	SessionTTL  time.Duration // how long a login session stays valid
+	DataRoot    string        // backing dir for the persistent rootfs layer; empty = disabled
 }
 
 // Protected reports whether the web shell requires a password to access.
 func (c config) Protected() bool { return c.Password != "" }
+
+// RootFS returns the on-disk location of the persistent root filesystem,
+// or "" when the /data translation layer is disabled.
+// Uses path.Join (not filepath): the result is passed to proot as a POSIX
+// path and must never pick up the host OS separator.
+func (c config) RootFS() string {
+	if c.DataRoot == "" {
+		return ""
+	}
+	return path.Join(c.DataRoot, "rootfs")
+}
+
+// resolveDataRoot decides where the persistent rootfs lives.
+//   - DATA_ROOT set (non-blank) -> that exact path (explicit opt-in)
+//   - DATA_ROOT unset/blank + /data exists -> /data (cloud-host auto-detect)
+//   - DATA_ROOT unset/blank + no /data    -> "" (layer disabled, legacy behavior)
+func resolveDataRoot(getenv func(string) string, dirExists func(string) bool) string {
+	if v := strings.TrimSpace(getenv("DATA_ROOT")); v != "" {
+		return v
+	}
+	if dirExists("/data") {
+		return "/data"
+	}
+	return ""
+}
 
 // loadConfig builds a config from the given environment getter.
 // It is tolerant: invalid values fall back to safe defaults.

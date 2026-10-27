@@ -12,4 +12,12 @@ services:
       PW: ""
       # PORT: 7681          # optional, defaults to 7681
       # SHELL: /bin/bash    # optional, defaults to /bin/bash
+    # /data translation layer: mounting /data (or setting DATA_ROOT) makes
+    # the terminal's "/" persistent — everything written or apt-installed
+    # inside survives restarts. Remove both lines for ephemeral mode.
+    volumes:
+      - webshell-data:/data
     restart: unless-stopped
+
+volumes:
+  webshell-data:

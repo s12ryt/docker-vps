@@ -74,3 +74,48 @@ func TestLoadConfigBlankPWMeansOpenMode(t *testing.T) {
 		t.Error("blank PW should be treated as unset (open mode)")
 	}
 }
+
+func TestResolveDataRootExplicit(t *testing.T) {
+	cases := map[string]string{
+		"/volume1":       "/volume1",
+		"  /mnt/pv  ":    "/mnt/pv",
+		"/data":          "/data",
+		"relative":       "relative",
+		"   ":            "", // blank explicit value is treated as unset
+	}
+	for raw, want := range cases {
+		got := resolveDataRoot(func(k string) string {
+			if k == "DATA_ROOT" {
+				return raw
+			}
+			return ""
+		}, func(string) bool { return false })
+		if got != want {
+			t.Errorf("resolveDataRoot(DATA_ROOT=%q) = %q, want %q", raw, got, want)
+		}
+	}
+}
+
+func TestResolveDataRootAutoDetect(t *testing.T) {
+	// not set + /data exists -> /data
+	got := resolveDataRoot(func(string) string { return "" }, func(p string) bool { return p == "/data" })
+	if got != "/data" {
+		t.Errorf("auto-detect with /data present = %q, want /data", got)
+	}
+	// not set + /data absent -> disabled
+	got = resolveDataRoot(func(string) string { return "" }, func(string) bool { return false })
+	if got != "" {
+		t.Errorf("auto-detect without /data = %q, want empty (disabled)", got)
+	}
+}
+
+func TestRootFSPath(t *testing.T) {
+	cfg := config{DataRoot: "/data"}
+	if got := cfg.RootFS(); got != "/data/rootfs" {
+		t.Errorf("RootFS() = %q, want /data/rootfs", got)
+	}
+	cfg = config{DataRoot: ""}
+	if got := cfg.RootFS(); got != "" {
+		t.Errorf("RootFS() with empty DataRoot = %q, want empty", got)
+	}
+}
