@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>WebShell</title>
+<link rel="stylesheet" href="/static/xterm.min.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1a1b26; }
+  #terminal { position: absolute; inset: 0; padding: 6px; }
+  #bar {
+    position: fixed; top: 8px; right: 10px; z-index: 10;
+    display: flex; gap: 8px; align-items: center;
+    font: 12px/1.4 system-ui, sans-serif; color: #a9b1d6;
+  }
+  #status { padding: 2px 10px; border-radius: 999px; background: rgba(255,255,255,.06); }
+  #status.online  { color: #9ece6a; }
+  #status.offline { color: #f7768e; }
+  #logout {
+    padding: 2px 10px; border-radius: 999px; cursor: pointer;
+    background: rgba(255,255,255,.06); color: #a9b1d6; border: none;
+  }
+  #logout:hover { background: rgba(255,255,255,.14); }
+</style>
+</head>
+<body data-page="terminal">
+  <div id="bar">
+    <span id="status" class="offline">connecting…</span>
+    <button id="logout" type="button" title="End session">⏻</button>
+  </div>
+  <div id="terminal"></div>
+
+<script src="/static/xterm.min.js"></script>
+<script src="/static/xterm-addon-fit.min.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var term = new window.Terminal({
+    cursorBlink: true,
+    fontSize: 14,
+    fontFamily: 'Menlo, Consolas, "DejaVu Sans Mono", monospace',
+    theme: {
+      background: '#1a1b26',
+      foreground: '#c0caf5',
+      cursor: '#c0caf5'
+    }
+  });
+  var fit = new window.FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('terminal'));
+  fit.fit();
+
+  var statusEl = document.getElementById('status');
+  var ws = null;
+  var reconnectDelay = 500;
+  var manuallyClosed = false;
+
+  function setStatus(on) {
+    statusEl.textContent = on ? 'online' : 'offline';
+    statusEl.className = on ? 'online' : 'offline';
+  }
+
+  function sendResize() {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ action: 'resize', cols: term.cols, rows: term.rows }));
+    }
+  }
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws');
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = function () {
+      setStatus(true);
+      reconnectDelay = 500;
+      sendResize();
+      term.focus();
+    };
+
+    ws.onmessage = function (ev) {
+      term.write(new Uint8Array(ev.data));
+    };
+
+    ws.onclose = function () {
+      setStatus(false);
+      if (!manuallyClosed) {
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+      }
+    };
+  }
+
+  term.onData(function (data) {
+    if (ws && ws.readyState === 1) {
+      ws.send(new TextEncoder().encode(data)); // binary frame = raw PTY input
+    }
+  });
+
+  term.onResize(sendResize);
+  window.addEventListener('resize', function () { fit.fit(); });
+
+  document.getElementById('logout').addEventListener('click', function () {
+    manuallyClosed = true;
+    if (ws) { ws.close(); }
+    window.location.href = '/logout';
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

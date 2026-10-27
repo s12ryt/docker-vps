@@ -1,0 +1,15 @@
+# local dev / self-host example
+services:
+  webshell:
+    build: .
+    image: docker-vps:local
+    container_name: webshell
+    ports:
+      - "7681:7681"
+    environment:
+      # empty (or omitted) = open mode, no password needed.
+      # set a value to require login, e.g. PW: my-secret
+      PW: ""
+      # PORT: 7681          # optional, defaults to 7681
+      # SHELL: /bin/bash    # optional, defaults to /bin/bash
+    restart: unless-stopped

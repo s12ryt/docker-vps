@@ -1,0 +1,9 @@
+# keep the build context minimal
+.git
+.github
+agent
+*.md
+docker-compose.yml
+.gitignore
+Dockerfile
+**/*_test.go
