@@ -19,12 +19,12 @@ func main() {
 		return err == nil && fi.IsDir()
 	})
 	if cfg.DataRoot != "" {
-		if err := initPersistLayer("/", cfg.PersistRoot()); err != nil {
+		if err := initDataRoot(cfg.DataRoot); err != nil {
 			// fatal on purpose: silently degrading would make users believe
 			// their files persist while everything lands in the container layer
-			log.Fatalf("cannot initialize persistent layer under %s: %v", cfg.DataRoot, err)
+			log.Fatalf("cannot initialize translate-layer data root under %s: %v", cfg.DataRoot, err)
 		}
-		log.Printf("persistent layer active: /usr /var /root /home /opt /etc are backed by %s (system state lives on the volume; image upgrades keep it)", cfg.DataRoot)
+		log.Printf("translate layer active: libc path rewriting sends /usr /var /etc /root /home /opt /srv (and usr-merge links) to %s/rootfs — container root stays real, all writes land on the volume", cfg.DataRoot)
 	}
 
 	srv := newServer(cfg)

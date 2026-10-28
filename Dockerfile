@@ -16,6 +16,19 @@ COPY webshell/ ./
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags='-s -w' -o /out/webshell .
 
+# ---------- translate-layer stage: build libdvps-t.so for the TARGET arch ----------
+# Compiled natively under the target platform (buildx QEMU-emulates foreign
+# archs): a native gcc toolchain is simpler and more reliable than
+# cross-compiling the preload library.
+FROM debian:bookworm-slim AS tlib
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY webshell/translate/preload.c ./
+RUN mkdir -p /out \
+ && gcc -shared -fPIC -O2 -Wall -o /out/libdvps-t.so preload.c -ldl
+
 # ---------- runtime stage ----------
 FROM debian:bookworm-slim
 
@@ -37,15 +50,25 @@ RUN apt-get update \
       tini \
  && rm -rf /var/lib/apt/lists/*
 
-# webshell + tini live OUTSIDE the persisted directory tree: when the
-# persistent layer is active, /usr on the container root is replaced by a
-# symlink into the volume, which would shadow binaries placed under /usr.
-# /app is never migrated, so the freshly-built webshell always wins.
+# webshell + tini live OUTSIDE the rewritten tree (/app is not in the
+# translate-layer whitelist): the supervisor must stay on the image layer
+# so a fresh image always replaces it, and static binaries are unaffected
+# by ld.so.preload anyway.
 RUN mkdir -p /app && cp /usr/bin/tini /app/tini
 COPY --from=build /out/webshell /app/webshell
 
+# translate layer: global LD_PRELOAD path-rewrite library. Every dynamic
+# program (apt, dpkg, user shells...) gets /usr /var /etc ... rewritten to
+# /data/rootfs/... when the seeded marker exists; static binaries and the
+# build-time RUNs below (file writes only) are unaffected.
+COPY --from=tlib /out/libdvps-t.so /usr/lib/libdvps-t.so
+RUN chmod 755 /usr/lib/libdvps-t.so \
+ && echo '/usr/lib/libdvps-t.so' > /etc/ld.so.preload \
+ && chmod 644 /etc/ld.so.preload
+
 ENV PORT=7681 \
-    SHELL=/bin/bash
+    SHELL=/bin/bash \
+    LD_LIBRARY_PATH=/data/rootfs/usr/lib/x86_64-linux-gnu:/data/rootfs/usr/lib/x86_64-linux-gnu/systemd:/data/rootfs/usr/lib
 
 EXPOSE 7681
 

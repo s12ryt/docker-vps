@@ -1,295 +1,227 @@
 package main
 
+// T-layer (translate layer) data-root initialization for docker-vps v1.3.0+.
+//
+// The translate layer (webshell/translate/preload.c -> /usr/lib/libdvps-t.so,
+// loaded globally via /etc/ld.so.preload) rewrites whitelisted absolute paths
+// (/usr /var /etc /root /home /opt /srv /bin /sbin /lib /lib64 /libx32) to
+// <DATA_ROOT>/rootfs/... at the libc call level, so all reads and writes land
+// on the /data volume while the container root stays a real, symlink-free
+// filesystem (image layer, read-only in practice).
+//
+// This file's job: make <DATA_ROOT>/rootfs contain a complete OS tree before
+// the first dynamic process starts.
+//
+//   - fresh volume: seed it by copying the image-layer whitelist trees
+//     (one-time, ~600MB on first boot; idempotent via .dvps-seeded marker)
+//   - v1.2.x volume upgrade: the volume wins — everything already on the
+//     volume is kept as-is, and only image files the volume lacks are
+//     backfilled (v1.2.x only ever put *written* /etc entries and the
+//     symlinked big dirs on the volume, so most image /etc files were never
+//     there; backfill closes those gaps without clobbering user data)
+//   - /bin /sbin /lib /lib64 /libx32: replicated as whatever the image root
+//     has (usr-merge symlinks on bookworm), inside the volume.
+
 import (
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-// persistDirs are migrated wholesale into the persistent layer on first
-// boot and replaced by absolute symlinks at the container root, so that
-// every write lands on the volume. /usr covers usr-merge layouts: /bin,
-// /lib, ... are relative symlinks into /usr and keep resolving through
-// the /usr symlink.
-var persistDirs = []string{"usr", "var", "root", "home", "opt"}
+const seedMarker = ".dvps-seeded"
 
-// etcBindMounts are the files Docker bind-mounts over /etc at container
-// start. They must stay real files: replacing them with symlinks fails
-// with "Device or resource busy" and would break the bind mount.
-var etcBindMounts = map[string]bool{
-	"resolv.conf": true,
-	"hostname":    true,
-	"hosts":       true,
+// seedTopDirs are whitelisted top-level directories merged from the image
+// layer into the volume.
+var seedTopDirs = []string{"usr", "var", "etc", "root", "home", "opt", "srv"}
+
+// seedTopLinks are top-level entries that are usr-merge symlinks on
+// bookworm. We replicate the image's actual link targets instead of
+// hardcoding them; if the image has a real directory there instead, we merge
+// it like a regular tree.
+var seedTopLinks = []string{"bin", "sbin", "lib", "lib64", "libx32"}
+
+// initDataRoot seeds <dataRoot>/rootfs from the image layer. Idempotent:
+// returns immediately when the .dvps-seeded marker exists.
+// accountFiles are kept as REAL files in the container /etc and synced both
+// ways (newest mtime wins) with the volume on every boot: nss_files and the
+// dynamic loader read these via libc-internal opens that bypass the
+// translate layer, so they must exist on the container side as well
+// (v1.2.1 lesson, revived for the T-layer).
+var accountFiles = []string{
+	"passwd", "passwd-", "shadow", "shadow-",
+	"group", "group-", "gshadow", "gshadow-",
+	"subuid", "subuid-", "subgid", "subgid-",
+	".pwd.lock",
 }
 
-// etcAccountFiles are the user/group databases under /etc. They must
-// NEVER be replaced by symlinks: systemd-sysusers opens them with
-// O_NOFOLLOW (fails with ELOOP — "Failed to take /etc/passwd lock:
-// Too many levels of symbolic links"), and the shadow toolkit updates
-// them atomically via tmpfile+rename, which would replace the symlink
-// itself and desync the volume. Instead they stay real files and are
-// mirrored onto the volume by mtime at every boot (syncAccountFile).
-var etcAccountFiles = map[string]bool{
-	"passwd":    true,
-	"passwd-":   true,
-	"shadow":    true,
-	"shadow-":   true,
-	"group":     true,
-	"group-":    true,
-	"gshadow":   true,
-	"gshadow-":  true,
-	"subuid":    true,
-	"subuid-":   true,
-	"subgid":    true,
-	"subgid-":   true,
-	".pwd.lock": true,
-}
-
-// initPersistLayer turns the container root into a symlink farm backed
-// by the persistent layer (the mounted volume). The shell then runs
-// natively — no path translation, no ptrace, apt & friends just work.
-//
-// Semantics:
-//   - first boot: image content is seeded into the persist layer,
-//     then replaced by symlinks
-//   - later boots: whatever the volume already has wins over the image
-//     layer (nothing is overwritten — "the VPS disk" is authoritative)
-//   - /etc keeps its real directory and is migrated per entry, because
-//     Docker bind-mounts resolv.conf/hostname/hosts over it
-//
-// Idempotent: entries that are already symlinks are skipped, so a
-// restart on the same (mutated) root is a no-op.
-func initPersistLayer(srcRoot, persist string) error {
-	if err := os.MkdirAll(persist, 0o755); err != nil {
-		return fmt.Errorf("create persist layer: %w", err)
+func initDataRoot(dataRoot string) error {
+	vol := filepath.Join(dataRoot, "rootfs")
+	// Account-file sync runs on EVERY boot (independent of the seed marker):
+	// dpkg/useradd write the container side, nss reads the container side,
+	// and this sync keeps the volume copy durable across container rebuilds.
+	syncAccountFiles(vol)
+	marker := filepath.Join(vol, seedMarker)
+	if _, err := os.Lstat(marker); err == nil {
+		return nil // already seeded — fast path, also covers v1.3.0+ reboots
 	}
-	for _, d := range persistDirs {
-		if err := migrateDir(filepath.Join(srcRoot, d), filepath.Join(persist, d)); err != nil {
-			return fmt.Errorf("migrate %s: %w", d, err)
-		}
+	if err := os.MkdirAll(vol, 0o755); err != nil {
+		return fmt.Errorf("dvps: mkdir %s: %w", vol, err)
 	}
-	return initEtcHybrid(filepath.Join(srcRoot, "etc"), filepath.Join(persist, "etc"))
-}
-
-// migrateDir moves the real directory src onto dst (seeding dst from it
-// if needed) and leaves an absolute symlink behind. If src is already a
-// symlink the call is a no-op; if dst already exists its content wins.
-func migrateDir(src, dst string) error {
-	fi, err := os.Lstat(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // not present in this image — fine
-		}
-		return err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil // already migrated
-	}
-	if _, err := os.Lstat(dst); os.IsNotExist(err) {
-		if err := copyPath(src, dst); err != nil {
-			return fmt.Errorf("seed: %w", err)
-		}
-	} else if err != nil {
-		return err
-	}
-	if err := os.RemoveAll(src); err != nil {
-		return fmt.Errorf("remove original: %w", err)
-	}
-	return os.Symlink(dst, src)
-}
-
-// initEtcHybrid migrates /etc entry by entry: bind-mounted files and
-// pre-existing symlinks are left in place, everything else is moved
-// into the persist layer and symlinked. Volume entries that already
-// exist are kept (image content only backfills what is missing).
-func initEtcHybrid(srcEtc, dstEtc string) error {
-	fi, err := os.Lstat(srcEtc)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil // already migrated
-	}
-	if _, err := os.Lstat(dstEtc); os.IsNotExist(err) {
-		if err := copyPath(srcEtc, dstEtc); err != nil {
-			return fmt.Errorf("seed etc: %w", err)
-		}
-	} else if err != nil {
-		return err
-	}
-
-	// Account files are synchronized by fixed name, NOT by directory
-	// listing: entries that exist only on the volume (e.g. subuid seeded
-	// by an earlier boot) must be restored into the container, and
-	// ReadDir(srcEtc) below would never see them.
-	for name := range etcAccountFiles {
-		if err := syncAccountFile(filepath.Join(srcEtc, name), filepath.Join(dstEtc, name)); err != nil {
-			return fmt.Errorf("sync %s: %w", name, err)
-		}
-	}
-
-	entries, err := os.ReadDir(srcEtc)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if etcBindMounts[e.Name()] {
-			continue // Docker bind mount — must stay a real file
-		}
-		src := filepath.Join(srcEtc, e.Name())
-		dst := filepath.Join(dstEtc, e.Name())
-		if etcAccountFiles[e.Name()] {
-			continue // already synced by name above — never symlink these
-		}
-		if e.Type()&fs.ModeSymlink != 0 {
-			continue // leave pre-existing symlinks alone
-		}
-		if _, err := os.Lstat(dst); os.IsNotExist(err) {
-			if err := copyPath(src, dst); err != nil {
-				return fmt.Errorf("backfill %s: %w", e.Name(), err)
-			}
-		} else if err != nil {
+	for _, d := range seedTopDirs {
+		if err := seedMerge(filepath.Join("/", d), filepath.Join(vol, d)); err != nil {
 			return err
 		}
-		if err := os.RemoveAll(src); err != nil {
-			return fmt.Errorf("remove %s: %w", e.Name(), err)
+	}
+	for _, l := range seedTopLinks {
+		if err := seedTopLink(filepath.Join("/", l), filepath.Join(vol, l)); err != nil {
+			return err
 		}
-		if err := os.Symlink(dst, src); err != nil {
-			return fmt.Errorf("symlink %s: %w", e.Name(), err)
-		}
+	}
+	if err := os.WriteFile(marker, []byte("docker-vps translate-layer seed\n"), 0o644); err != nil {
+		return fmt.Errorf("dvps: write seed marker: %w", err)
 	}
 	return nil
 }
 
-// syncAccountFile keeps /etc account databases (passwd, shadow, group,
-// ...) as REAL files inside the container and mirrors the newest copy
-// onto the volume instead of symlinking them. See etcAccountFiles for
-// why symlinking is not an option.
-//
-// Boot-time sync semantics:
-//   - a v1.2.0 leftover symlink at src is materialized back into a real
-//     file from the volume copy
-//   - when both sides exist, the newer mtime wins on both sides
-//   - when only one side exists, it is copied to the other
-func syncAccountFile(src, dst string) error {
-	srcFi, srcErr := os.Lstat(src)
-	if srcErr != nil && !os.IsNotExist(srcErr) {
-		return srcErr
+// seedTopLink replicates a usr-merge top-level symlink (bin->usr/bin ...) on
+// the volume. If the image has a real directory there instead, falls back to
+// a regular merge.
+func seedTopLink(src, dst string) error {
+	target, err := os.Readlink(src)
+	if err != nil {
+		// not a symlink in the image: merge it as a normal tree (if present)
+		return seedMerge(src, dst)
 	}
-	dstFi, dstErr := os.Lstat(dst)
-	if dstErr != nil && !os.IsNotExist(dstErr) {
-		return dstErr
+	if _, err := os.Lstat(dst); err == nil {
+		return nil // volume already has an entry — volume wins
 	}
-
-	// v1.2.0 migration: src is a symlink — rebuild the real file from
-	// the volume copy so O_NOFOLLOW consumers work again.
-	if srcFi != nil && srcFi.Mode()&os.ModeSymlink != 0 {
-		if dstFi == nil {
-			// no volume copy either: drop the dangling symlink
-			return os.RemoveAll(src)
-		}
-		tmp := src + ".v121mig"
-		if err := copyPath(dst, tmp); err != nil {
-			return fmt.Errorf("materialize: %w", err)
-		}
-		if err := os.RemoveAll(src); err != nil {
-			return err
-		}
-		return os.Rename(tmp, src)
+	if err := os.Symlink(target, dst); err != nil {
+		return fmt.Errorf("dvps: symlink %s -> %s: %w", dst, target, err)
 	}
-
-	switch {
-	case srcFi == nil && dstFi == nil:
-		return nil // nothing anywhere — fine
-	case srcFi == nil: // only on the volume: restore into /etc
-		return copyPath(dst, src)
-	case dstFi == nil: // only in /etc: snapshot onto the volume
-		return copyPath(src, dst)
-	}
-
-	// both real files: newest mtime wins on both sides
-	switch {
-	case srcFi.ModTime().After(dstFi.ModTime()):
-		return copyPath(src, dst)
-	case dstFi.ModTime().After(srcFi.ModTime()):
-		return copyPath(dst, src)
-	}
-	return nil // same timestamp — leave as is
+	return nil
 }
 
-// copyPath copies src to dst, preserving symlinks, directory structure,
-// file modes and contents. Special files (sockets, devices) are skipped.
-func copyPath(src, dst string) error {
+// seedMerge recursively merges the image tree at src into the volume at dst.
+// Merge rule: if the volume already has an entry at dst, the volume wins and
+// the image entry is skipped (for directories we still recurse to backfill
+// missing children). If the volume has nothing there, the image entry is
+// copied (file, symlink or directory).
+func seedMerge(src, dst string) error {
 	fi, err := os.Lstat(src)
 	if err != nil {
-		return err
+		if os.IsNotExist(err) {
+			return nil // image layer has no such tree — nothing to seed
+		}
+		return fmt.Errorf("dvps: lstat %s: %w", src, err)
 	}
-	switch {
-	case fi.Mode()&os.ModeSymlink != 0:
+	switch fi.Mode() & os.ModeType {
+	case os.ModeDir:
+		if err := os.MkdirAll(dst, fi.Mode().Perm()); err != nil {
+			return fmt.Errorf("dvps: mkdir %s: %w", dst, err)
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return fmt.Errorf("dvps: readdir %s: %w", src, err)
+		}
+		for _, e := range entries {
+			if err := seedMerge(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+				return err
+			}
+		}
+	case os.ModeSymlink:
+		if _, err := os.Lstat(dst); err == nil {
+			return nil // volume wins
+		}
 		target, err := os.Readlink(src)
 		if err != nil {
-			return err
+			return fmt.Errorf("dvps: readlink %s: %w", src, err)
 		}
-		return os.Symlink(target, dst)
-
-	case fi.IsDir():
-		return filepath.WalkDir(src, func(p string, e fs.DirEntry, err error) error {
-			if err != nil {
+		if err := os.Symlink(target, dst); err != nil {
+			return fmt.Errorf("dvps: symlink %s: %w", dst, err)
+		}
+	default: // regular file (ModeType == 0 lands here via default)
+		if fi.Mode().IsRegular() {
+			if _, err := os.Lstat(dst); err == nil {
+				return nil // volume wins
+			}
+			if err := copySeedFile(src, dst, fi.Mode().Perm()); err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(src, p)
-			if err != nil {
-				return err
-			}
-			target := filepath.Join(dst, rel)
-			info, err := e.Info()
-			if err != nil {
-				return err
-			}
-			switch {
-			case info.Mode()&os.ModeSymlink != 0:
-				link, err := os.Readlink(p)
-				if err != nil {
-					return err
-				}
-				return os.Symlink(link, target)
-			case e.IsDir():
-				if err := os.MkdirAll(target, info.Mode().Perm()); err != nil {
-					return err
-				}
-				return nil
-			case info.Mode().IsRegular():
-				return copyFile(p, target, info.Mode().Perm())
-			default:
-				return nil // skip sockets/devices/fifos
-			}
-		})
+		}
+		// fifo/socket/device: skip — not expected in whitelisted image trees
+	}
+	return nil
+}
 
-	case fi.Mode().IsRegular():
-		return copyFile(src, dst, fi.Mode().Perm())
+// copySeedFile copies a regular file, creating dst exclusively so a racing
+// writer can never be clobbered by the seed.
+func copySeedFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("dvps: open %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return fmt.Errorf("dvps: create %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return fmt.Errorf("dvps: copy %s -> %s: %w", src, dst, err)
+	}
+	return out.Close()
+}
 
-	default:
-		return nil // skip special files at top level too
+// syncAccountFiles mirrors the 13 account files between the container /etc
+// and <vol>/etc on every boot. See the accountFiles doc comment above for
+// why these files must live on BOTH sides. Newest mtime wins; a file that
+// exists on only one side is copied to the other (first boot seeds the
+// volume, a rebuilt container restores from the volume). Best-effort:
+// errors are swallowed — account sync must never block startup.
+func syncAccountFiles(vol string) {
+	etcVol := filepath.Join(vol, "etc")
+	for _, name := range accountFiles {
+		c := filepath.Join("/etc", name)
+		v := filepath.Join(etcVol, name)
+		cs, cerr := os.Lstat(c)
+		vs, verr := os.Lstat(v)
+		switch {
+		case cerr != nil && verr != nil:
+			// neither side has it — nothing to do
+		case cerr != nil:
+			// volume-only (rebuilt container over a v1.2.x volume) — restore
+			if vs.Mode().IsRegular() {
+				_ = copyFileOverwrite(v, c, vs.Mode().Perm())
+			}
+		case verr != nil:
+			// container-only (first boot) — persist into the volume
+			if cs.Mode().IsRegular() {
+				_ = copyFileOverwrite(c, v, cs.Mode().Perm())
+			}
+		default:
+			if !cs.Mode().IsRegular() || !vs.Mode().IsRegular() {
+				continue
+			}
+			if vs.ModTime().After(cs.ModTime()) {
+				_ = copyFileOverwrite(v, c, vs.Mode().Perm())
+			} else if cs.ModTime().After(vs.ModTime()) {
+				_ = copyFileOverwrite(c, v, cs.Mode().Perm())
+			}
+		}
 	}
 }
 
-// copyFile copies one regular file, preserving mode.
-func copyFile(src, dst string, mode fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
+// copyFileOverwrite copies src onto dst even when dst already exists.
+// Account files are tiny, so write-to-temp + rename is atomic enough.
+func copyFileOverwrite(src, dst string, perm os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	tmp := dst + ".dvps-sync"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
@@ -297,5 +229,8 @@ func copyFile(src, dst string, mode fs.FileMode) error {
 		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }

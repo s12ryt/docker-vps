@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -29,9 +30,10 @@ type controlMsg struct {
 }
 
 // handleWS upgrades to a websocket and bridges it to a PTY running the shell.
-// The shell runs natively in the container root; when the persistent layer is
-// active, /usr /var /root /home /opt /etc are symlinks into the volume, so
-// everything the user writes or installs persists across container restarts.
+// With the translate layer active, libdvps-t.so (global via /etc/ld.so.preload)
+// rewrites whitelisted paths to <DATA_ROOT>/rootfs, so everything the user
+// writes or installs persists across container restarts while the container
+// root stays a real, symlink-free filesystem.
 func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -45,7 +47,22 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := exec.Command(s.cfg.ShellPath)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME=/root")
+	env := append(os.Environ(), "TERM=xterm-256color", "HOME=/root")
+	if s.cfg.DataRoot != "" {
+		// T-layer: /etc/ld.so.preload already loads libdvps-t.so globally;
+		// LD_PRELOAD is the belt-and-suspenders fallback. LD_LIBRARY_PATH
+		// prefers volume-side libraries: the kernel loads the image-layer
+		// ld-linux (PT_INTERP bypasses interception), so without this a
+		// freshly installed binary needing newer glibc symbols could resolve
+		// against the image's older libc.
+		vroot := s.cfg.PersistRoot()
+		llp := filepath.Join(vroot, "usr", "lib", "x86_64-linux-gnu") + ":" + filepath.Join(vroot, "usr", "lib", "x86_64-linux-gnu", "systemd") + ":" + filepath.Join(vroot, "usr", "lib")
+		if old := os.Getenv("LD_LIBRARY_PATH"); old != "" {
+			llp += ":" + old
+		}
+		env = append(env, "LD_PRELOAD=/usr/lib/libdvps-t.so", "LD_LIBRARY_PATH="+llp)
+	}
+	cmd.Env = env
 	cmd.Dir = home
 
 	ptmx, err := pty.Start(cmd) // spawn the shell attached to a PTY
