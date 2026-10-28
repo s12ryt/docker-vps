@@ -8,43 +8,123 @@ import (
 	"path/filepath"
 )
 
-// rootfsDirs is the whitelist of top-level directories copied from the
-// container root into the persistent rootfs on first start.
-// /proc /sys /dev are bound by proot itself; /run holds host runtime state
-// (sockets, pids) that must not leak into the guest; /tmp is recreated fresh.
-var rootfsDirs = []string{
-	"bin", "etc", "home", "lib", "lib64", "media",
-	"mnt", "opt", "root", "sbin", "srv", "usr", "var",
+// persistDirs are migrated wholesale into the persistent layer on first
+// boot and replaced by absolute symlinks at the container root, so that
+// every write lands on the volume. /usr covers usr-merge layouts: /bin,
+// /lib, ... are relative symlinks into /usr and keep resolving through
+// the /usr symlink.
+var persistDirs = []string{"usr", "var", "root", "home", "opt"}
+
+// etcBindMounts are the files Docker bind-mounts over /etc at container
+// start. They must stay real files: replacing them with symlinks fails
+// with "Device or resource busy" and would break the bind mount.
+var etcBindMounts = map[string]bool{
+	"resolv.conf": true,
+	"hostname":    true,
+	"hosts":       true,
 }
 
-// initRootfs makes sure rootfs holds a usable guest root filesystem.
-// srcRoot is the (real) root to copy from, rootfs the guest location.
-// It is idempotent: once usr/ exists inside rootfs, nothing is copied again,
-// so user data and apt-installed packages survive container restarts.
-func initRootfs(srcRoot, rootfs string) error {
-	if _, err := os.Stat(filepath.Join(rootfs, "usr")); err == nil {
-		return nil // already initialized — never overwrite the "VPS disk"
+// initPersistLayer turns the container root into a symlink farm backed
+// by the persistent layer (the mounted volume). The shell then runs
+// natively — no path translation, no ptrace, apt & friends just work.
+//
+// Semantics:
+//   - first boot: image content is seeded into the persist layer,
+//     then replaced by symlinks
+//   - later boots: whatever the volume already has wins over the image
+//     layer (nothing is overwritten — "the VPS disk" is authoritative)
+//   - /etc keeps its real directory and is migrated per entry, because
+//     Docker bind-mounts resolv.conf/hostname/hosts over it
+//
+// Idempotent: entries that are already symlinks are skipped, so a
+// restart on the same (mutated) root is a no-op.
+func initPersistLayer(srcRoot, persist string) error {
+	if err := os.MkdirAll(persist, 0o755); err != nil {
+		return fmt.Errorf("create persist layer: %w", err)
 	}
-	if err := os.MkdirAll(rootfs, 0o755); err != nil {
-		return fmt.Errorf("create rootfs dir: %w", err)
-	}
-	for _, d := range rootfsDirs {
-		src := filepath.Join(srcRoot, d)
-		if _, err := os.Lstat(src); err != nil {
-			continue // not present in this image — fine
-		}
-		if err := copyPath(src, filepath.Join(rootfs, d)); err != nil {
-			return fmt.Errorf("copy %s: %w", d, err)
-		}
-	}
-	// pseudo mount points; proot binds the real ones over these
-	for _, d := range []string{"proc", "sys", "dev", "tmp"} {
-		if err := os.MkdirAll(filepath.Join(rootfs, d), 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", d, err)
+	for _, d := range persistDirs {
+		if err := migrateDir(filepath.Join(srcRoot, d), filepath.Join(persist, d)); err != nil {
+			return fmt.Errorf("migrate %s: %w", d, err)
 		}
 	}
-	if err := os.Chmod(filepath.Join(rootfs, "tmp"), 0o777|os.ModeSticky); err != nil {
-		return fmt.Errorf("chmod tmp: %w", err)
+	return initEtcHybrid(filepath.Join(srcRoot, "etc"), filepath.Join(persist, "etc"))
+}
+
+// migrateDir moves the real directory src onto dst (seeding dst from it
+// if needed) and leaves an absolute symlink behind. If src is already a
+// symlink the call is a no-op; if dst already exists its content wins.
+func migrateDir(src, dst string) error {
+	fi, err := os.Lstat(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // not present in this image — fine
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil // already migrated
+	}
+	if _, err := os.Lstat(dst); os.IsNotExist(err) {
+		if err := copyPath(src, dst); err != nil {
+			return fmt.Errorf("seed: %w", err)
+		}
+	} else if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(src); err != nil {
+		return fmt.Errorf("remove original: %w", err)
+	}
+	return os.Symlink(dst, src)
+}
+
+// initEtcHybrid migrates /etc entry by entry: bind-mounted files and
+// pre-existing symlinks are left in place, everything else is moved
+// into the persist layer and symlinked. Volume entries that already
+// exist are kept (image content only backfills what is missing).
+func initEtcHybrid(srcEtc, dstEtc string) error {
+	fi, err := os.Lstat(srcEtc)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil // already migrated
+	}
+	if _, err := os.Lstat(dstEtc); os.IsNotExist(err) {
+		if err := copyPath(srcEtc, dstEtc); err != nil {
+			return fmt.Errorf("seed etc: %w", err)
+		}
+	} else if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(srcEtc)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if etcBindMounts[e.Name()] {
+			continue // Docker bind mount — must stay a real file
+		}
+		if e.Type()&fs.ModeSymlink != 0 {
+			continue // leave pre-existing symlinks alone
+		}
+		src := filepath.Join(srcEtc, e.Name())
+		dst := filepath.Join(dstEtc, e.Name())
+		if _, err := os.Lstat(dst); os.IsNotExist(err) {
+			if err := copyPath(src, dst); err != nil {
+				return fmt.Errorf("backfill %s: %w", e.Name(), err)
+			}
+		} else if err != nil {
+			return err
+		}
+		if err := os.RemoveAll(src); err != nil {
+			return fmt.Errorf("remove %s: %w", e.Name(), err)
+		}
+		if err := os.Symlink(dst, src); err != nil {
+			return fmt.Errorf("symlink %s: %w", e.Name(), err)
+		}
 	}
 	return nil
 }

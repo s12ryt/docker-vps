@@ -28,36 +28,10 @@ type controlMsg struct {
 	Rows   int    `json:"rows,omitempty"`
 }
 
-// buildShellCmd returns the argv used to spawn the PTY shell.
-// With the /data translation layer enabled the shell is wrapped in proot,
-// so inside the terminal "/" is backed by <DataRoot>/rootfs and everything
-// the user writes or installs there persists across container restarts.
-//
-// Notes on proot invocation (verified against proot 5.1.0 in Debian bookworm):
-//   - "-R" (root + "recommended" bindings) mis-translates writes: /root
-//     writes leaked to the host root. Use plain "-r" + explicit binds.
-//   - proot 5.1.0 has no "--" separator; the program path must follow the
-//     options directly (shell paths start with "/", so no ambiguity).
-func buildShellCmd(cfg config) []string {
-	if rootfs := cfg.RootFS(); rootfs != "" {
-		return []string{
-			"proot",
-			"-r", rootfs,
-			"-b", "/proc",
-			"-b", "/dev",
-			"-b", "/sys",
-			"-b", "/etc/resolv.conf", // DNS is managed by the container runtime
-			"-b", "/etc/hosts",
-			"-b", "/etc/host.conf",
-			"-b", "/etc/nsswitch.conf",
-			"-w", "/root",
-			cfg.ShellPath, "-l",
-		}
-	}
-	return []string{cfg.ShellPath}
-}
-
 // handleWS upgrades to a websocket and bridges it to a PTY running the shell.
+// The shell runs natively in the container root; when the persistent layer is
+// active, /usr /var /root /home /opt /etc are symlinks into the volume, so
+// everything the user writes or installs persists across container restarts.
 func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -70,8 +44,7 @@ func (s *server) handleWS(w http.ResponseWriter, r *http.Request) {
 		home = "/root"
 	}
 
-	argv := buildShellCmd(s.cfg)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(s.cfg.ShellPath)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "HOME=/root")
 	cmd.Dir = home
 

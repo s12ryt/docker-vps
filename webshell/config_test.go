@@ -109,13 +109,13 @@ func TestResolveDataRootAutoDetect(t *testing.T) {
 	}
 }
 
-func TestRootFSPath(t *testing.T) {
+func TestPersistRootPath(t *testing.T) {
 	cfg := config{DataRoot: "/data"}
-	if got := cfg.RootFS(); got != "/data/rootfs" {
-		t.Errorf("RootFS() = %q, want /data/rootfs", got)
+	if got := cfg.PersistRoot(); got != "/data/rootfs" {
+		t.Errorf("PersistRoot() = %q, want /data/rootfs", got)
 	}
 	cfg = config{DataRoot: ""}
-	if got := cfg.RootFS(); got != "" {
-		t.Errorf("RootFS() with empty DataRoot = %q, want empty", got)
+	if got := cfg.PersistRoot(); got != "" {
+		t.Errorf("PersistRoot() with empty DataRoot = %q, want empty", got)
 	}
 }

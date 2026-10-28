@@ -25,11 +25,12 @@ type config struct {
 // Protected reports whether the web shell requires a password to access.
 func (c config) Protected() bool { return c.Password != "" }
 
-// RootFS returns the on-disk location of the persistent root filesystem,
-// or "" when the /data translation layer is disabled.
-// Uses path.Join (not filepath): the result is passed to proot as a POSIX
-// path and must never pick up the host OS separator.
-func (c config) RootFS() string {
+// PersistRoot returns the on-disk location of the persistent layer
+// (symlink farm backing /usr /var /root /home /opt /etc), or "" when the
+// /data persistence layer is disabled.
+// Uses path.Join (not filepath): the result is used as a POSIX symlink
+// target and must never pick up the host OS separator.
+func (c config) PersistRoot() string {
 	if c.DataRoot == "" {
 		return ""
 	}

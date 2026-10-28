@@ -20,8 +20,6 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 FROM debian:bookworm-slim
 
 # base tools expected from a slim VPS-style image
-# proot powers the /data translation layer (persistent guest rootfs without
-# privileged mounts — works on docker cloud hosts that only expose /data).
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       bash \
@@ -37,18 +35,24 @@ RUN apt-get update \
       tmux \
       htop \
       tini \
-      proot \
  && rm -rf /var/lib/apt/lists/*
 
-COPY --from=build /out/webshell /usr/local/bin/webshell
+# webshell + tini live OUTSIDE the persisted directory tree: when the
+# persistent layer is active, /usr on the container root is replaced by a
+# symlink into the volume, which would shadow binaries placed under /usr.
+# /app is never migrated, so the freshly-built webshell always wins.
+RUN mkdir -p /app && cp /usr/bin/tini /app/tini
+COPY --from=build /out/webshell /app/webshell
 
 ENV PORT=7681 \
     SHELL=/bin/bash
 
 EXPOSE 7681
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=2s --retries=3 \
+# start-period is generous: first boot with a mounted /data copies ~600MB
+# (the whole /usr tree) into the volume before the shell is ready.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5m --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/healthz" || exit 1
 
 # tini reaps orphaned shell processes and forwards signals
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/webshell"]
+ENTRYPOINT ["/app/tini", "--", "/app/webshell"]

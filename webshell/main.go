@@ -12,19 +12,19 @@ import (
 func main() {
 	cfg := loadConfig(os.Getenv)
 
-	// /data translation layer: explicit DATA_ROOT wins, otherwise auto-detect
+	// /data persistence layer: explicit DATA_ROOT wins, otherwise auto-detect
 	// a mounted /data (common on docker cloud hosts). Disabled when neither.
 	cfg.DataRoot = resolveDataRoot(os.Getenv, func(p string) bool {
 		fi, err := os.Stat(p)
 		return err == nil && fi.IsDir()
 	})
 	if cfg.DataRoot != "" {
-		if err := initRootfs("/", cfg.RootFS()); err != nil {
+		if err := initPersistLayer("/", cfg.PersistRoot()); err != nil {
 			// fatal on purpose: silently degrading would make users believe
 			// their files persist while everything lands in the container layer
-			log.Fatalf("cannot initialize persistent rootfs under %s: %v", cfg.DataRoot, err)
+			log.Fatalf("cannot initialize persistent layer under %s: %v", cfg.DataRoot, err)
 		}
-		log.Printf("persistent rootfs active: %s (guest / is backed by %s)", cfg.RootFS(), cfg.DataRoot)
+		log.Printf("persistent layer active: /usr /var /root /home /opt /etc are backed by %s (system state lives on the volume; image upgrades keep it)", cfg.DataRoot)
 	}
 
 	srv := newServer(cfg)
