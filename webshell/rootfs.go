@@ -24,6 +24,29 @@ var etcBindMounts = map[string]bool{
 	"hosts":       true,
 }
 
+// etcAccountFiles are the user/group databases under /etc. They must
+// NEVER be replaced by symlinks: systemd-sysusers opens them with
+// O_NOFOLLOW (fails with ELOOP — "Failed to take /etc/passwd lock:
+// Too many levels of symbolic links"), and the shadow toolkit updates
+// them atomically via tmpfile+rename, which would replace the symlink
+// itself and desync the volume. Instead they stay real files and are
+// mirrored onto the volume by mtime at every boot (syncAccountFile).
+var etcAccountFiles = map[string]bool{
+	"passwd":    true,
+	"passwd-":   true,
+	"shadow":    true,
+	"shadow-":   true,
+	"group":     true,
+	"group-":    true,
+	"gshadow":   true,
+	"gshadow-":  true,
+	"subuid":    true,
+	"subuid-":   true,
+	"subgid":    true,
+	"subgid-":   true,
+	".pwd.lock": true,
+}
+
 // initPersistLayer turns the container root into a symlink farm backed
 // by the persistent layer (the mounted volume). The shell then runs
 // natively — no path translation, no ptrace, apt & friends just work.
@@ -99,6 +122,17 @@ func initEtcHybrid(srcEtc, dstEtc string) error {
 	} else if err != nil {
 		return err
 	}
+
+	// Account files are synchronized by fixed name, NOT by directory
+	// listing: entries that exist only on the volume (e.g. subuid seeded
+	// by an earlier boot) must be restored into the container, and
+	// ReadDir(srcEtc) below would never see them.
+	for name := range etcAccountFiles {
+		if err := syncAccountFile(filepath.Join(srcEtc, name), filepath.Join(dstEtc, name)); err != nil {
+			return fmt.Errorf("sync %s: %w", name, err)
+		}
+	}
+
 	entries, err := os.ReadDir(srcEtc)
 	if err != nil {
 		return err
@@ -107,11 +141,14 @@ func initEtcHybrid(srcEtc, dstEtc string) error {
 		if etcBindMounts[e.Name()] {
 			continue // Docker bind mount — must stay a real file
 		}
+		src := filepath.Join(srcEtc, e.Name())
+		dst := filepath.Join(dstEtc, e.Name())
+		if etcAccountFiles[e.Name()] {
+			continue // already synced by name above — never symlink these
+		}
 		if e.Type()&fs.ModeSymlink != 0 {
 			continue // leave pre-existing symlinks alone
 		}
-		src := filepath.Join(srcEtc, e.Name())
-		dst := filepath.Join(dstEtc, e.Name())
 		if _, err := os.Lstat(dst); os.IsNotExist(err) {
 			if err := copyPath(src, dst); err != nil {
 				return fmt.Errorf("backfill %s: %w", e.Name(), err)
@@ -127,6 +164,62 @@ func initEtcHybrid(srcEtc, dstEtc string) error {
 		}
 	}
 	return nil
+}
+
+// syncAccountFile keeps /etc account databases (passwd, shadow, group,
+// ...) as REAL files inside the container and mirrors the newest copy
+// onto the volume instead of symlinking them. See etcAccountFiles for
+// why symlinking is not an option.
+//
+// Boot-time sync semantics:
+//   - a v1.2.0 leftover symlink at src is materialized back into a real
+//     file from the volume copy
+//   - when both sides exist, the newer mtime wins on both sides
+//   - when only one side exists, it is copied to the other
+func syncAccountFile(src, dst string) error {
+	srcFi, srcErr := os.Lstat(src)
+	if srcErr != nil && !os.IsNotExist(srcErr) {
+		return srcErr
+	}
+	dstFi, dstErr := os.Lstat(dst)
+	if dstErr != nil && !os.IsNotExist(dstErr) {
+		return dstErr
+	}
+
+	// v1.2.0 migration: src is a symlink — rebuild the real file from
+	// the volume copy so O_NOFOLLOW consumers work again.
+	if srcFi != nil && srcFi.Mode()&os.ModeSymlink != 0 {
+		if dstFi == nil {
+			// no volume copy either: drop the dangling symlink
+			return os.RemoveAll(src)
+		}
+		tmp := src + ".v121mig"
+		if err := copyPath(dst, tmp); err != nil {
+			return fmt.Errorf("materialize: %w", err)
+		}
+		if err := os.RemoveAll(src); err != nil {
+			return err
+		}
+		return os.Rename(tmp, src)
+	}
+
+	switch {
+	case srcFi == nil && dstFi == nil:
+		return nil // nothing anywhere — fine
+	case srcFi == nil: // only on the volume: restore into /etc
+		return copyPath(dst, src)
+	case dstFi == nil: // only in /etc: snapshot onto the volume
+		return copyPath(src, dst)
+	}
+
+	// both real files: newest mtime wins on both sides
+	switch {
+	case srcFi.ModTime().After(dstFi.ModTime()):
+		return copyPath(src, dst)
+	case dstFi.ModTime().After(srcFi.ModTime()):
+		return copyPath(dst, src)
+	}
+	return nil // same timestamp — leave as is
 }
 
 // copyPath copies src to dst, preserving symlinks, directory structure,

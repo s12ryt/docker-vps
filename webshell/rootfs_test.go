@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // mkSrcTree builds a fake container root filesystem to migrate from.
@@ -111,6 +112,24 @@ func assertRealDir(t *testing.T, path string) {
 	}
 }
 
+// assertRealFile checks the path is a regular file and NOT a symlink.
+// Used for /etc account files: systemd-sysusers opens them with
+// O_NOFOLLOW and the shadow toolkit replaces them via rename — both
+// break when the path is a symlink.
+func assertRealFile(t *testing.T, path string) {
+	t.Helper()
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("%s: must not be a symlink (account file)", path)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("%s: not a regular file (mode %v)", path, fi.Mode())
+	}
+}
+
 func TestInitPersistLayerFirstBoot(t *testing.T) {
 	src := t.TempDir()
 	persist := t.TempDir()
@@ -133,11 +152,14 @@ func TestInitPersistLayerFirstBoot(t *testing.T) {
 
 	// /etc stays a real directory...
 	assertRealDir(t, filepath.Join(src, "etc"))
-	// ...with per-entry symlinks
+	// ...with per-entry symlinks (config trees only)
 	assertSymlink(t, filepath.Join(src, "etc", "apt"), filepath.Join(persist, "etc", "apt"))
-	assertSymlink(t, filepath.Join(src, "etc", "shadow"), filepath.Join(persist, "etc", "shadow"))
 	assertFile(t, filepath.Join(src, "etc", "apt", "sources.list"), "deb http://deb.debian.org/debian bookworm main\n", 0644)
+	// account files stay REAL files (systemd-sysusers O_NOFOLLOW compat),
+	// with a snapshot copy on the volume
+	assertRealFile(t, filepath.Join(src, "etc", "shadow"))
 	assertFile(t, filepath.Join(src, "etc", "shadow"), "secret", 0600)
+	assertFile(t, filepath.Join(persist, "etc", "shadow"), "secret", 0600)
 
 	// Docker bind-mounted files must remain real files
 	for _, f := range []string{"resolv.conf", "hostname", "hosts"} {
@@ -282,6 +304,124 @@ func TestInitPersistLayerV110VolumeUpgrade(t *testing.T) {
 	assertFile(t, filepath.Join(persist, "bin", "v110-tool"), "tool", 0755)
 	// src root keeps its usr-merge symlink (not replaced by the v1.1.0 copy)
 	assertSymlink(t, filepath.Join(src, "bin"), "usr/bin")
-	// etc handled as hybrid again (per-entry symlinks)
-	assertSymlink(t, filepath.Join(src, "etc", "shadow"), filepath.Join(persist, "etc", "shadow"))
+	// etc handled as hybrid again; account files stay real (v1.2.1 semantics)
+	assertRealFile(t, filepath.Join(src, "etc", "shadow"))
+}
+
+func TestInitPersistLayerAccountFilesStayReal(t *testing.T) {
+	src := t.TempDir()
+	persist := t.TempDir()
+	mkSrcTree(t, src)
+	// ship the usual account files in the image /etc
+	if err := os.WriteFile(filepath.Join(src, "etc", "passwd"), []byte("root:x:0:0:root:/root:/bin/sh\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "etc", "group"), []byte("root:x:0:\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	// account files never become symlinks...
+	assertRealFile(t, filepath.Join(src, "etc", "passwd"))
+	assertRealFile(t, filepath.Join(src, "etc", "group"))
+	assertRealFile(t, filepath.Join(src, "etc", "shadow"))
+	// ...but they are snapshotted to the volume
+	assertFile(t, filepath.Join(persist, "etc", "passwd"), "root:x:0:0:root:/root:/bin/sh\n", 0644)
+	assertFile(t, filepath.Join(persist, "etc", "group"), "root:x:0:\n", 0644)
+	// non-account entries still symlink
+	assertSymlink(t, filepath.Join(src, "etc", "apt"), filepath.Join(persist, "etc", "apt"))
+}
+
+func TestInitPersistLayerAccountMtimeSync(t *testing.T) {
+	src := t.TempDir()
+	persist := t.TempDir()
+	mkSrcTree(t, src)
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	future := time.Now().Add(2 * time.Hour)
+
+	// volume side is newer -> container gets overwritten
+	if err := os.WriteFile(filepath.Join(persist, "etc", "shadow"), []byte("volume-newer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(persist, "etc", "shadow"), future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("second init: %v", err)
+	}
+	assertFile(t, filepath.Join(src, "etc", "shadow"), "volume-newer", 0600)
+
+	// container side is newer -> volume gets overwritten
+	if err := os.WriteFile(filepath.Join(src, "etc", "shadow"), []byte("container-newer"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(src, "etc", "shadow"), future.Add(time.Hour), future.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("third init: %v", err)
+	}
+	assertFile(t, filepath.Join(persist, "etc", "shadow"), "container-newer", 0600)
+	assertFile(t, filepath.Join(src, "etc", "shadow"), "container-newer", 0600)
+}
+
+func TestInitPersistLayerAccountV120SymlinkMigration(t *testing.T) {
+	src := t.TempDir()
+	persist := t.TempDir()
+	mkSrcTree(t, src)
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("first init: %v", err)
+	}
+
+	// simulate a v1.2.0 boot: account file replaced by a symlink into the volume
+	if err := os.WriteFile(filepath.Join(persist, "etc", "shadow"), []byte("from-volume"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sp := filepath.Join(src, "etc", "shadow")
+	if err := os.Remove(sp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(persist, "etc", "shadow"), sp); err != nil {
+		t.Fatal(err)
+	}
+
+	// v1.2.1 boot: symlink must be restored to a real file with volume content
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("migration init: %v", err)
+	}
+	assertRealFile(t, sp)
+	assertFile(t, sp, "from-volume", 0600)
+}
+
+func TestInitPersistLayerAccountSingleSideBackfill(t *testing.T) {
+	src := t.TempDir()
+	persist := t.TempDir()
+	mkSrcTree(t, src)
+
+	// image has passwd; volume has nothing yet -> volume gets a copy
+	if err := os.WriteFile(filepath.Join(src, "etc", "passwd"), []byte("img-passwd"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// volume has subuid (from an older boot); image does not -> container gets it
+	if err := os.MkdirAll(filepath.Join(persist, "etc"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(persist, "etc", "subuid"), []byte("root:100000:65536\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := initPersistLayer(src, persist); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	assertRealFile(t, filepath.Join(src, "etc", "passwd"))
+	assertFile(t, filepath.Join(persist, "etc", "passwd"), "img-passwd", 0644)
+	assertRealFile(t, filepath.Join(src, "etc", "subuid"))
+	assertFile(t, filepath.Join(src, "etc", "subuid"), "root:100000:65536\n", 0644)
 }
